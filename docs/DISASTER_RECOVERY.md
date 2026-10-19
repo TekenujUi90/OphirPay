@@ -17,7 +17,7 @@
 4. [Phase 1 — Isolate & Communicate](#phase-1--isolate--communicate)
 5. [Phase 2 — Restore the Database](#phase-2--restore-the-database)
 6. [Phase 3 — Verify the Restored Database](#phase-3--verify-the-restored-database)
-7. [Phase 4 — Chain-vs-Database Reconciliation](#phase-4--chainvs-database-reconciliation)
+7. [Phase 4 — Chain-vs-Database Reconciliation](#phase-4--chain-vs-database-reconciliation)
 8. [Phase 5 — Cut Traffic to the Recovered System](#phase-5--cut-traffic-to-the-recovered-system)
 9. [Phase 6 — Post-Recovery Verification](#phase-6--post-recovery-verification)
 10. [Phase 7 — Rollback (if the Restore Fails)](#phase-7--rollback-if-the-restore-fails)
@@ -30,55 +30,12 @@
 
 | Metric | Target | How it is met |
 |--------|--------|---------------|
-| **RPO** (Recovery Point Objective — maximum acceptable data loss) | **24 hours** | `.github/workflows/db-backup.yml` runs `pg_dump → gzip → S3` every day at **03:00 UTC** (`cron: "0 3 * * *"`). The worst-case scenario is a failure that occurs just before the next backup, meaning up to 24 hours of transactions must be reconciled from on-chain state (see [Phase 4](#phase-4--chainvs-database-reconciliation)). |
+| **RPO** (Recovery Point Objective — maximum acceptable data loss) | **24 hours** | `.github/workflows/db-backup.yml` runs `pg_dump → gzip → S3` every day at **03:00 UTC** (`cron: "0 3 * * *"`). The worst-case scenario is a failure that occurs just before the next backup, meaning up to 24 hours of transactions must be reconciled from on-chain state (see [Phase 4](#phase-4--chain-vs-database-reconciliation)). |
 | **RTO** (Recovery Time Objective — time to restore service) | **2 hours** | Breakdown: ~15 min to locate the backup and spin up a fresh PostgreSQL instance, ~30 min to restore + verify (depending on database size), ~45 min for chain reconciliation, ~15 min for traffic cutover and smoke testing. The 2-hour target assumes a single on-call engineer with the required credentials and tool access. |
 
 Backups are stored in **S3 bucket `ophirpay-backups`** with the `STANDARD_IA`
 storage class and a **30-day retention policy**. This means up to 30 recovery
 points are available at any given time.
-
-### 1.1 Backup monitoring & retention
-
-A backup is only a guarantee if it is both **fresh** and **restorable**. Both
-properties are asserted automatically rather than assumed (issues #751, #752).
-
-#### Retention policy
-
-| Copy | Retained for | Location |
-|------|--------------|----------|
-| Daily | **30 days** (`BACKUP_RETENTION_DAYS`) | `s3://ophirpay-backups/ophirpay-<YYYY-MM-DDTHH-MM-SSZ>.sql.gz`, `STANDARD_IA` |
-| Sunday (weekly) | **90 days** (`BACKUP_WEEKLY_RETENTION_DAYS`) | same bucket |
-
-Expiry is applied by the `Apply retention policy` step in
-[`.github/workflows/db-backup.yml`](../.github/workflows/db-backup.yml): a
-non-Sunday copy is deleted once it is older than 30 days, and a Sunday copy once
-it is older than 90 days. Configure an S3 lifecycle rule on the bucket as a
-backstop in case the workflow itself stops running.
-
-#### Freshness assertion
-
-`db-backup.yml` runs on a **second, independent schedule** (09:00 UTC) whose
-`monitor` job asserts that the newest `*.sql.gz` object is younger than
-`BACKUP_MAX_AGE_HOURS` (default **26 h** = the 24 h RPO plus a 2 h grace for
-upload time and clock skew). Running the monitor independently of the backup
-job is what makes a **stopped** backup visible — a scheduled workflow that never
-runs cannot report its own absence.
-
-#### Failure notification
-
-When the `backup` or `monitor` job fails, a `notify` job opens (or comments on)
-a tracking issue titled **“🚨 Database backup workflow failed”**, with the run
-result and a link to the failed run. A failed backup is therefore visible
-during triage rather than only in the Actions tab.
-
-#### Restore drill
-
-[`.github/workflows/db-restore-drill.yml`](../.github/workflows/db-restore-drill.yml)
-runs weekly and on demand. It restores the newest backup into a disposable
-Postgres through [`scripts/restore-drill.sh`](../scripts/restore-drill.sh),
-asserts row counts on the core tables, and verifies `prisma migrate status`. A
-corrupt or missing backup fails the drill. See
-[Step 2.1](#step-21--run-the-automated-restore-drill).
 
 ---
 

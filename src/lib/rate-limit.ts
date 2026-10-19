@@ -21,22 +21,9 @@
  * Set the matching token (`REDIS_TOKEN`, `REDIS_REST_TOKEN` or
  * `UPSTASH_REDIS_REST_TOKEN`) for hosted REST providers such as Upstash.
  * With neither configured the in-memory store is used, exactly as before.
- *
- * This is the *single* rate-limit module (issue #759). On top of the store it
- * owns the three things that used to be duplicated across the auth, lookup and
- * proxy callers:
- *
- *   • the bucket-key builder   — `buildRateLimitKey()`
- *   • the response header set  — `formatRateLimitHeaders()`
- *   • the endpoint policies    — `AUTH_RATE_LIMIT_POLICY`, etc. (data, not code)
- *
- * `enforceRateLimit()` is the generic entry point: a caller passes a policy and
- * the shared store enforces the per-IP and (optional) per-target buckets. The
- * auth and lookup modules are now thin wrappers over these policies, and the
- * edge proxy consumes the same store/interface and header writer.
  */
 
-import { ERROR_CODES, errorEnvelope } from "@/lib/error-codes";
+import { sanitizeRateLimitKey } from "@/lib/client-ip";
 
 // ── Interface ──────────────────────────────────────────────────
 
@@ -87,15 +74,16 @@ export class InMemoryRateLimitStore implements RateLimitStore {
     windowMs: number,
     maxRequests: number
   ): Promise<RateLimitResult> {
+    const safeKey = sanitizeRateLimitKey(key);
     const now = Date.now();
-    let entry = this.store.get(key);
+    let entry = this.store.get(safeKey);
 
     if (!entry || entry.resetAt < now) {
       entry = { count: 0, resetAt: now + windowMs };
     }
 
     entry.count++;
-    this.store.set(key, entry);
+    this.store.set(safeKey, entry);
 
     // Periodic cleanup — prevent unbounded memory growth under abuse
     if (this.store.size > 10_000) {
@@ -109,7 +97,7 @@ export class InMemoryRateLimitStore implements RateLimitStore {
   }
 
   async reset(key: string): Promise<void> {
-    this.store.delete(key);
+    this.store.delete(sanitizeRateLimitKey(key));
   }
 }
 
@@ -130,12 +118,13 @@ export class RedisRateLimitStore implements RateLimitStore {
     windowMs: number,
     maxRequests: number
   ): Promise<RateLimitResult> {
+    const safeKey = sanitizeRateLimitKey(key);
     const now = Date.now();
     const ttl = Math.ceil(windowMs / 1000);
 
-    const count = await this.redis.incr(key);
+    const count = await this.redis.incr(safeKey);
     if (count === 1) {
-      await this.redis.expire(key, ttl);
+      await this.redis.expire(safeKey, ttl);
     }
 
     const remaining = Math.max(0, maxRequests - count);
@@ -143,7 +132,7 @@ export class RedisRateLimitStore implements RateLimitStore {
   }
 
   async reset(key: string): Promise<void> {
-    await this.redis.del(key);
+    await this.redis.del(sanitizeRateLimitKey(key));
   }
 }
 
@@ -203,14 +192,15 @@ export class HttpRedisRateLimitStore implements RateLimitStore {
     windowMs: number,
     maxRequests: number
   ): Promise<RateLimitResult> {
+    const safeKey = sanitizeRateLimitKey(key);
     const now = Date.now();
     const ttl = Math.ceil(windowMs / 1000);
 
     // INCR is atomic on the Redis side, so every replica observes the same
     // counter — this is what makes the limit global across instances.
-    const count = Number(await this.command(["INCR", key]));
+    const count = Number(await this.command(["INCR", safeKey]));
     if (count === 1) {
-      await this.command(["EXPIRE", key, ttl]);
+      await this.command(["EXPIRE", safeKey, ttl]);
     }
 
     const remaining = Math.max(0, maxRequests - count);
@@ -218,7 +208,7 @@ export class HttpRedisRateLimitStore implements RateLimitStore {
   }
 
   async reset(key: string): Promise<void> {
-    await this.command(["DEL", key]);
+    await this.command(["DEL", sanitizeRateLimitKey(key)]);
   }
 }
 
@@ -321,8 +311,7 @@ export async function initRateLimitStore(): Promise<void> {
   if (redisUrl && TCP_REDIS_URL.test(redisUrl)) {
     try {
       // Dynamic import — ioredis is an optional dependency, absent on the edge.
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const RedisModule: any = await import("ioredis");
+      const RedisModule = await import("ioredis");
       const redis = new RedisModule.Redis(redisUrl, {
         maxRetriesPerRequest: 3,
         lazyConnect: true,
@@ -344,209 +333,69 @@ export async function initRateLimitStore(): Promise<void> {
   _store = createRateLimitStoreFromEnv();
 }
 
-// ── Bucket keys, headers, policies and enforcement ─────────────
+/** Rate limit window for CSP reports (1 minute in milliseconds, issue #1392). */
+export const CSP_REPORT_RATE_LIMIT_WINDOW_MS = 60_000;
+
+/** Maximum CSP violation reports allowed per client per minute (#1392). */
+export const CSP_REPORT_RATE_LIMIT_MAX = 60;
+
+// ── API key lifecycle quotas (#1370) ───────────────────────────
 //
-// Everything below is shared by the edge proxy and the Node route handlers so
-// window semantics, bucket keys and header formatting cannot drift between
-// them (issue #759).
+// Creating and rotating API keys are privileged, low-frequency operations.
+// Each call mints a credential and (for rotation) writes a replacement row, so
+// an authenticated client stuck in a retry loop can inflate the ApiKey table
+// and leave a trail of live credentials. A dedicated per-account bucket keeps
+// that blast radius small without throttling the rest of the API.
+//
+// The bucket is deliberately shared by create *and* rotate: they cost the same
+// and must not be usable as two independent escape hatches.
 
-/**
- * Read the client IP from the standard proxy headers.
- *
- * Accepts either a `Request`/`NextRequest` or anything exposing `headers.get`,
- * so the same helper serves route handlers and the edge middleware.
- */
-export function getClientIp(request: {
-  headers: { get(name: string): string | null };
-}): string {
-  return (
-    request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ||
-    request.headers.get("x-real-ip") ||
-    "unknown"
-  );
-}
+/** Sliding window for API-key create/rotate operations (1 hour). */
+export const API_KEY_MUTATION_WINDOW_MS = 60 * 60 * 1000;
 
-/**
- * Build a namespaced bucket key. Keeping the `scope:id` shape in one place is
- * what lets the edge and Node limiters share buckets safely.
- */
-export function buildRateLimitKey(scope: string, id: string): string {
-  return `${scope}:${id}`;
-}
+/** Maximum create/rotate operations per account per window. */
+export const API_KEY_MUTATION_MAX = 10;
 
-/**
- * Format the standard rate-limit response headers from a store result.
- *
- * This is the single header writer: `rate-limit-headers.ts`, the auth and
- * lookup 429 builders and `src/proxy.ts` all funnel through it, so a client
- * sees byte-identical `X-RateLimit-*` / `Retry-After` values regardless of
- * which limiter rejected it.
- */
-export function formatRateLimitHeaders(input: {
+/** Maximum simultaneously active (unrevoked, unrotated, unexpired) keys. */
+export const MAX_ACTIVE_API_KEYS = 5;
+
+export interface ApiKeyMutationQuota {
+  /** Whether the operation may proceed. */
+  allowed: boolean;
+  /** The configured per-window maximum. */
   limit: number;
+  /** Operations left in the current window (0 once exhausted). */
   remaining: number;
   /** Unix-ms timestamp when the window resets. */
   resetAt: number;
-}): Record<string, string> {
-  const resetSeconds = Math.ceil(input.resetAt / 1000);
-  const retryAfter =
-    input.remaining <= 0
-      ? Math.max(1, resetSeconds - Math.floor(Date.now() / 1000))
-      : 0;
-  return {
-    "Retry-After": String(retryAfter),
-    "X-RateLimit-Limit": String(input.limit),
-    "X-RateLimit-Remaining": String(input.remaining),
-    "X-RateLimit-Reset": String(resetSeconds),
-    "X-Content-Type-Options": "nosniff",
-  };
-}
-
-/** Human-facing message used by every rate-limited response. */
-export const RATE_LIMIT_MESSAGE = "Too many requests. Please try again later.";
-
-/** Build the canonical 429 JSON response for a rejected request. */
-export function rateLimitedResponse(
-  code: string,
-  limit: number,
-  result: RateLimitResult,
-): Response {
-  return Response.json(errorEnvelope(code, RATE_LIMIT_MESSAGE), {
-    status: 429,
-    headers: formatRateLimitHeaders({
-      limit,
-      remaining: result.remaining,
-      resetAt: result.resetAt,
-    }),
-  });
-}
-
-/** A single bucket in a rate-limit policy. */
-export interface RateLimitBucket {
-  /** Historical key prefix, e.g. `auth:ip`. */
-  scope: string;
-  /** Error code emitted when this bucket is exhausted. */
-  code: string;
-  /** Max requests per window. Read lazily so env overrides apply per call. */
-  limit: () => number;
 }
 
 /**
- * An endpoint policy expressed as data: a window, a per-IP bucket and an
- * optional per-target bucket (wallet / address). Adding an endpoint means
- * adding a policy object, not new enforcement code.
- */
-export interface RateLimitPolicy {
-  /** Stable name used for diagnostics and tests. */
-  name: string;
-  /** Window duration in milliseconds. */
-  windowMs: number;
-  /** Bucket charged on every request (keyed by client IP). */
-  ip: RateLimitBucket;
-  /** Optional second bucket keyed by a caller-supplied target. */
-  target?: RateLimitBucket;
-}
-
-function envInt(name: string, fallback: number): number {
-  const raw = process.env[name];
-  if (!raw) return fallback;
-  const parsed = parseInt(raw, 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
-}
-
-/** Wallet-auth endpoints (challenge mint / session issuance). */
-export const AUTH_RATE_LIMIT_POLICY: RateLimitPolicy = {
-  name: "auth",
-  windowMs: 60_000,
-  ip: {
-    scope: "auth:ip",
-    code: ERROR_CODES.RATE_LIMIT_IP,
-    limit: () => envInt("AUTH_RATE_LIMIT_IP_RPM", 30),
-  },
-  target: {
-    scope: "auth:wallet",
-    code: ERROR_CODES.RATE_LIMIT_WALLET,
-    limit: () => envInt("AUTH_RATE_LIMIT_WALLET_RPM", 10),
-  },
-};
-
-/** Wallet/address lookup endpoints (enumeration + RPC hammering). */
-export const LOOKUP_RATE_LIMIT_POLICY: RateLimitPolicy = {
-  name: "lookup",
-  windowMs: 60_000,
-  ip: {
-    scope: "lookup:ip",
-    code: ERROR_CODES.RATE_LIMIT_IP,
-    limit: () => envInt("LOOKUP_RATE_LIMIT_IP_RPM", 60),
-  },
-  target: {
-    scope: "lookup:addr",
-    code: ERROR_CODES.RATE_LIMIT_WALLET,
-    limit: () => envInt("LOOKUP_RATE_LIMIT_ADDR_RPM", 30),
-  },
-};
-
-/** Global per-IP limit enforced at the edge proxy for `/api/*`. */
-export const GLOBAL_RATE_LIMIT_POLICY: RateLimitPolicy = {
-  name: "global",
-  windowMs: 60_000,
-  ip: {
-    scope: "global",
-    code: ERROR_CODES.RATE_LIMITED,
-    limit: () =>
-      Math.max(1, parseInt(process.env.RATE_LIMIT_RPM || "120", 10) || 120),
-  },
-};
-
-export interface EnforceRateLimitOptions {
-  /** Charge the policy's target bucket against this value (if the policy has one). */
-  target?: string;
-  /** Per-call window override (tests). */
-  windowMs?: number;
-  /** Per-call per-IP limit override (tests). */
-  ipLimit?: number;
-  /** Per-call target-limit override (tests). */
-  targetLimit?: number;
-}
-
-/**
- * Enforce a rate-limit policy against a request.
+ * Charge one API-key mutation (create or rotate) against the account's
+ * hourly quota.
  *
- * Returns a 429 `Response` when the per-IP or per-target bucket is exhausted,
- * or `null` when the request is within every limit. Shared by the auth and
- * lookup routes; the edge proxy uses the store directly (it runs before route
- * dispatch).
+ * Keyed by user id — the account is the tenant boundary in OphirPay, so two
+ * sessions or API keys belonging to the same user share one bucket. Callers
+ * must still authenticate first: the quota never replaces auth, it only
+ * bounds authenticated abuse.
+ *
+ * @param userId Account to charge.
+ * @param store  Injectable store (defaults to the process-wide backend).
  */
-export async function enforceRateLimit(
-  request: { headers: { get(name: string): string | null } },
-  policy: RateLimitPolicy,
-  opts: EnforceRateLimitOptions = {},
-): Promise<Response | null> {
-  const windowMs = opts.windowMs ?? policy.windowMs;
-  const ipLimit = opts.ipLimit ?? policy.ip.limit();
-  const store = getRateLimitStore();
-  const ip = getClientIp(request);
-
-  const ipResult = await store.increment(
-    buildRateLimitKey(policy.ip.scope, ip),
-    windowMs,
-    ipLimit,
+export async function consumeApiKeyMutationQuota(
+  userId: string,
+  store: RateLimitStore = getRateLimitStore()
+): Promise<ApiKeyMutationQuota> {
+  const result = await store.increment(
+    `apikeys:mutation:${userId}`,
+    API_KEY_MUTATION_WINDOW_MS,
+    API_KEY_MUTATION_MAX
   );
-  if (!ipResult.allowed) {
-    return rateLimitedResponse(policy.ip.code, ipLimit, ipResult);
-  }
 
-  if (policy.target && opts.target) {
-    const targetLimit = opts.targetLimit ?? policy.target.limit();
-    const targetResult = await store.increment(
-      buildRateLimitKey(policy.target.scope, opts.target),
-      windowMs,
-      targetLimit,
-    );
-    if (!targetResult.allowed) {
-      return rateLimitedResponse(policy.target.code, targetLimit, targetResult);
-    }
-  }
-
-  return null;
+  return {
+    allowed: result.allowed,
+    limit: API_KEY_MUTATION_MAX,
+    remaining: result.remaining,
+    resetAt: result.resetAt,
+  };
 }

@@ -21,13 +21,11 @@ vi.mock("@/lib/prisma", () => ({
   default: { webhook: { findMany: mocks.findMany } },
 }));
 
-// The dispatcher now imports its collaborators directly from the canonical
-// webhooks modules (#758); mock those, not the compatibility shims.
-vi.mock("@/lib/webhooks/delivery", () => ({
+vi.mock("@/lib/webhook-deliver", () => ({
   deliverWebhook: mocks.deliverWebhook,
 }));
 
-vi.mock("@/lib/webhooks/persistence", () => ({
+vi.mock("@/lib/webhook-event-store", () => ({
   storeWebhookEvent: mocks.storeWebhookEvent,
   recordWebhookDelivery: mocks.recordWebhookDelivery,
 }));
@@ -105,7 +103,11 @@ describe("dispatchWebhookEvent", () => {
       "w1",
       "evt_1",
       "SUCCESS",
-      { responseCode: 200, isReplay: false }
+      expect.objectContaining({
+        responseCode: 200,
+        isReplay: false,
+        attempts: 1,
+      })
     );
   });
 
@@ -116,7 +118,7 @@ describe("dispatchWebhookEvent", () => {
     expect(mocks.recordWebhookDelivery).not.toHaveBeenCalled();
   });
 
-  it("records a FAILED delivery when the endpoint rejects the payload", async () => {
+  it("dead-letters a delivery when the endpoint rejects the payload", async () => {
     mocks.findMany.mockResolvedValue([webhook("w1", "[]")]);
     mocks.deliverWebhook.mockResolvedValue({
       success: false,
@@ -130,8 +132,12 @@ describe("dispatchWebhookEvent", () => {
     expect(mocks.recordWebhookDelivery).toHaveBeenCalledWith(
       "w1",
       "evt_1",
-      "FAILED",
-      { responseCode: 500, isReplay: false }
+      "DEAD_LETTER",
+      expect.objectContaining({
+        responseCode: 500,
+        isReplay: false,
+        attempts: 3,
+      })
     );
   });
 
